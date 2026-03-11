@@ -28,3 +28,4 @@ ON ledger_entries(wallet_id, created_at ASC);
 
 
 TRUNCATE TABLE users, wallets, ledger_entries RESTART IDENTITY CASCADE;
+
