@@ -1,14 +1,16 @@
-import asyncio
+﻿import asyncio
 import logging
 import sys
 from collections import Counter
 from decimal import Decimal
 
-import psycopg
-from psycopg.rows import dict_row
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 
 from config import MONEY_QUANT
-from db import init_db, pool
+from db import SessionLocal, close_db, init_db
+from models import LedgerEntry, User, Wallet
 
 logger = logging.getLogger("wallet.concurrency_check")
 
@@ -24,104 +26,86 @@ def _fmt_money(value: Decimal) -> str:
 
 
 async def _prepare_state() -> int:
-    async with pool.connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO users (user_id, password_hash)
-                    VALUES (%s, %s)
-                    ON CONFLICT (user_id) DO NOTHING;
-                    """,
-                    (USER_ID, "demo_hash"),
+    async with SessionLocal() as session:
+        async with session.begin():
+            user_stmt = (
+                insert(User)
+                .values(user_id=USER_ID, password_hash="demo_hash")
+                .on_conflict_do_nothing(index_elements=[User.user_id])
+            )
+            await session.execute(user_stmt)
+
+            wallet_stmt = (
+                insert(Wallet)
+                .values(user_id=USER_ID, balance=START_BALANCE, version=0)
+                .on_conflict_do_update(
+                    index_elements=[Wallet.user_id],
+                    set_={"balance": START_BALANCE, "version": 0},
                 )
-                await cur.execute(
-                    """
-                    INSERT INTO wallets (user_id, balance, version)
-                    VALUES (%s, %s, 0)
-                    ON CONFLICT (user_id) DO UPDATE
-                        SET balance = EXCLUDED.balance,
-                            version = 0
-                    RETURNING id;
-                    """,
-                    (USER_ID, START_BALANCE),
-                )
-                wallet_row = await cur.fetchone()
-                wallet_id = wallet_row["id"]
-                await cur.execute(
-                    "DELETE FROM ledger_entries WHERE wallet_id = %s;",
-                    (wallet_id,),
-                )
-                return wallet_id
+                .returning(Wallet.id)
+            )
+            result = await session.execute(wallet_stmt)
+            wallet_id = result.scalar_one()
+
+            await session.execute(delete(LedgerEntry).where(LedgerEntry.wallet_id == wallet_id))
+            return wallet_id
 
 
 async def _debit_once() -> tuple[bool, str | None]:
     for _ in range(MAX_RETRIES):
-        async with pool.connection() as conn:
-            async with conn.transaction():
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        "SELECT id, balance, version FROM wallets WHERE user_id = %s;",
-                        (USER_ID,),
+        async with SessionLocal() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(Wallet.id, Wallet.balance, Wallet.version).where(
+                        Wallet.user_id == USER_ID
                     )
-                    wallet = await cur.fetchone()
-                    if wallet is None:
-                        return False, "Wallet not found"
-                    if wallet["balance"] < DEBIT_AMOUNT:
-                        return False, "Insufficient balance"
+                )
+                wallet = result.first()
+                if wallet is None:
+                    return False, "Wallet not found"
+                if wallet.balance < DEBIT_AMOUNT:
+                    return False, "Insufficient balance"
 
-                    new_balance = wallet["balance"] - DEBIT_AMOUNT
-                    await cur.execute(
-                        """
-                        UPDATE wallets
-                        SET balance = %s,
-                            version = version + 1
-                        WHERE id = %s AND version = %s
-                        RETURNING balance;
-                        """,
-                        (new_balance, wallet["id"], wallet["version"]),
-                    )
-                    updated = await cur.fetchone()
-                    if updated is None:
-                        await asyncio.sleep(0)
-                        continue
+                new_balance = wallet.balance - DEBIT_AMOUNT
+                update_stmt = (
+                    update(Wallet)
+                    .where(Wallet.id == wallet.id, Wallet.version == wallet.version)
+                    .values(balance=new_balance, version=Wallet.version + 1)
+                    .returning(Wallet.balance)
+                )
+                updated = await session.execute(update_stmt)
+                if updated.first() is None:
+                    await asyncio.sleep(0)
+                    continue
 
-                    await cur.execute(
-                        """
-                        INSERT INTO ledger_entries (wallet_id, entry_type, amount, balance_after)
-                        VALUES (%s, 'debit', %s, %s);
-                        """,
-                        (wallet["id"], DEBIT_AMOUNT, updated["balance"]),
-                    )
-                    return True, None
+                ledger = LedgerEntry(
+                    wallet_id=wallet.id,
+                    entry_type="debit",
+                    amount=DEBIT_AMOUNT,
+                    balance_after=new_balance,
+                )
+                session.add(ledger)
+                return True, None
     return False, "Conflict"
 
 
 async def _get_final_state(wallet_id: int) -> tuple[Decimal, int]:
-    async with pool.connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "SELECT balance FROM wallets WHERE id = %s;",
-                (wallet_id,),
-            )
-            row = await cur.fetchone()
-            balance = row["balance"] if row else Decimal("0")
+    async with SessionLocal() as session:
+        balance_result = await session.execute(
+            select(Wallet.balance).where(Wallet.id == wallet_id)
+        )
+        balance = balance_result.scalar_one_or_none() or Decimal("0")
 
-            await cur.execute(
-                """
-                SELECT COUNT(*) AS total
-                FROM ledger_entries
-                WHERE wallet_id = %s AND entry_type = 'debit';
-                """,
-                (wallet_id,),
-            )
-            count_row = await cur.fetchone()
-            debit_entries = int(count_row["total"]) if count_row else 0
+        count_result = await session.execute(
+            select(func.count())
+            .select_from(LedgerEntry)
+            .where(LedgerEntry.wallet_id == wallet_id, LedgerEntry.entry_type == "debit")
+        )
+        debit_entries = int(count_result.scalar_one())
     return balance, debit_entries
 
 
 async def run_check() -> int:
-    await pool.open()
     try:
         await init_db()
         wallet_id = await _prepare_state()
@@ -153,18 +137,18 @@ async def run_check() -> int:
             )
         )
         return 0 if passed else 1
-    except psycopg.Error:
+    except SQLAlchemyError:
         logger.exception("concurrency_check_db_error")
         print("PHASE2_CONCURRENCY_CHECK: FAIL")
         print("successes=0 failures=0 final_balance=0.00 debit_ledger_entries=0 failure_reasons={}")
         return 1
     finally:
-        await pool.close()
+        await close_db()
 
 
 def main() -> None:
     if sys.platform.startswith("win"):
-        # psycopg async requires selector loop on Windows.
+        # SQLAlchemy async requires selector loop on Windows for asyncpg.
         policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
         if policy is not None:
             asyncio.set_event_loop_policy(policy())

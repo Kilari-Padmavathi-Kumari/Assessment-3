@@ -1,58 +1,38 @@
 import logging
+from collections.abc import AsyncIterator
 
-from psycopg_pool import AsyncConnectionPool
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from config import DATABASE_URL, DB_POOL_MAX_SIZE, DB_POOL_MIN_SIZE, DB_POOL_TIMEOUT
+from config import DATABASE_URL, DB_POOL_MAX_SIZE, DB_POOL_TIMEOUT
+from models import Base
 
-pool = AsyncConnectionPool(
-    conninfo=DATABASE_URL,
-    open=False,
-    min_size=DB_POOL_MIN_SIZE,
-    max_size=DB_POOL_MAX_SIZE,
-    timeout=DB_POOL_TIMEOUT,
-)
 logger = logging.getLogger("wallet.db")
 
-SCHEMA_STATEMENTS = [
-    """
-    CREATE TABLE IF NOT EXISTS users (
-        user_id TEXT PRIMARY KEY,
-        password_hash TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """,
-    """
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS password_hash TEXT NOT NULL DEFAULT '';
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS wallets (
-        id BIGSERIAL PRIMARY KEY,
-        user_id TEXT UNIQUE NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-        balance NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK (balance >= 0),
-        version INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """,
-    """
-    ALTER TABLE wallets
-    ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 0;
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS ledger_entries (
-        id BIGSERIAL PRIMARY KEY,
-        wallet_id BIGINT NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
-        entry_type TEXT NOT NULL CHECK (entry_type IN ('credit', 'debit')),
-        amount NUMERIC(18,2) NOT NULL CHECK (amount > 0),
-        balance_after NUMERIC(18,2) NOT NULL CHECK (balance_after >= 0),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_ledger_wallet_created_at
-    ON ledger_entries(wallet_id, created_at DESC);
-    """,
-]
+
+def _ensure_async_db_url(url: str) -> str:
+    if "+asyncpg" in url:
+        return url
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+
+ASYNC_DATABASE_URL = _ensure_async_db_url(DATABASE_URL)
+
+engine = create_async_engine(
+    ASYNC_DATABASE_URL,
+    pool_size=DB_POOL_MAX_SIZE,
+    max_overflow=0,
+    pool_timeout=DB_POOL_TIMEOUT,
+    pool_pre_ping=True,
+)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
+        yield session
 
 
 async def init_db() -> None:
@@ -61,23 +41,21 @@ async def init_db() -> None:
     Safe to run multiple times (idempotent).
     """
     logger.info("db_init_started")
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            for index, statement in enumerate(SCHEMA_STATEMENTS, start=1):
-                logger.debug("db_init_statement_%s", index)
-                await cur.execute(statement)
-        await conn.commit()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     logger.info("db_init_completed")
 
 
 async def db_healthcheck() -> bool:
     """Return True if DB can be queried, else False."""
     try:
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT 1;")
-                await cur.fetchone()
+        async with SessionLocal() as session:
+            await session.execute(text("SELECT 1;"))
         return True
     except Exception:
         logger.exception("db_healthcheck_failed")
         return False
+
+
+async def close_db() -> None:
+    await engine.dispose()

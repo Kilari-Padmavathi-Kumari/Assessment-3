@@ -1,22 +1,25 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+﻿import asyncio
 import os
 import sys
 import secrets
 from decimal import Decimal
 from pathlib import Path
 
-import psycopg
 import pytest
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 load_dotenv()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import app
+from db import _ensure_async_db_url
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql://postgres:localhost@localhost:5432/newwallet_db"
 )
+ASYNC_DATABASE_URL = _ensure_async_db_url(DATABASE_URL)
 
 
 @pytest.fixture(scope="module")
@@ -25,14 +28,16 @@ def client():
         yield test_client
 
 
+async def _truncate_all() -> None:
+    engine = create_async_engine(ASYNC_DATABASE_URL, pool_pre_ping=True)
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE TABLE ledger_entries, wallets, users RESTART IDENTITY CASCADE;"))
+    await engine.dispose()
+
+
 @pytest.fixture(scope="function", autouse=True)
 def clean_db():
-    with psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "TRUNCATE TABLE ledger_entries, wallets, users RESTART IDENTITY CASCADE;"
-            )
-        conn.commit()
+    asyncio.run(_truncate_all())
 
 
 def test_health(client: TestClient):
@@ -196,6 +201,8 @@ def test_concurrent_debit_consistency(client: TestClient):
         return 409
 
     statuses: list[int] = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     with ThreadPoolExecutor(max_workers=50) as executor:
         futures = [executor.submit(do_debit) for _ in range(request_count)]
         for future in as_completed(futures):
